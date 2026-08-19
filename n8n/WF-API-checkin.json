@@ -1,5 +1,5 @@
 {
-  "name": "LS2026 — Check-In API",
+  "name": "LS2026 (CC) — Check-In API",
   "nodes": [
     {
       "id": "seed-trigger",
@@ -35,17 +35,18 @@
         -320,
         60
       ],
-      "webhookId": "ls2026-auth",
+      "webhookId": "ls2026-cc-auth",
       "parameters": {
         "multipleMethods": true,
         "httpMethods": [
           "POST",
           "OPTIONS"
         ],
-        "path": "ls2026/auth",
+        "path": "ls2026-cc/auth",
         "responseMode": "responseNode",
         "options": {
-          "rawBody": false
+          "rawBody": false,
+          "allowedOrigins": "https://mes178.github.io"
         }
       }
     },
@@ -60,7 +61,7 @@
       ],
       "parameters": {
         "mode": "runOnceForAllItems",
-        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// WF-C — POST /webhook/ls2026/auth   { pin, device } -> { session_token, expires_at }\n//\n// Rate limited per source IP: 5 attempts / 15 minutes (spec §10, §12.4).\n\nconst req = $input.first().json;\nconst method = (req.method || 'POST').toUpperCase();\nif (method === 'OPTIONS') return reply(204, {});\n\nconst body = req.body || {};\nconst headers = req.headers || {};\nconst ip = header(headers, 'x-forwarded-for') || header(headers, 'x-real-ip') || 'unknown';\nconst device = String(body.device || '').trim().slice(0, 40);\nconst pin = String(body.pin || '');\n\nconst store = $getWorkflowStaticData('global');\nstore.pinAttempts = store.pinAttempts || {};\n\nconst now = Date.now();\nconst record = store.pinAttempts[ip] || { count: 0, first: now };\nif (now - record.first > PIN_WINDOW_MS) {\n  record.count = 0;\n  record.first = now;\n}\n\nif (record.count >= PIN_MAX_ATTEMPTS) {\n  store.pinAttempts[ip] = record;\n  return reply(429, { message: 'Too many attempts. Wait 15 minutes.' });\n}\n\nif (!device) return reply(400, { message: 'Device label is required.' });\n\nif (!constantTimeEqual(pin, secrets().pin)) {\n  record.count += 1;\n  store.pinAttempts[ip] = record;\n  return reply(401, { message: 'Wrong PIN.' });\n}\n\ndelete store.pinAttempts[ip];\n\n// Housekeeping: drop attempt records older than the window so the bag cannot\n// grow without bound across the event.\nfor (const [key, value] of Object.entries(store.pinAttempts)) {\n  if (now - value.first > PIN_WINDOW_MS) delete store.pinAttempts[key];\n}\n\nconst session = await issueSession(device);\nreturn reply(200, {\n  session_token: session.token,\n  expires_at: session.payload.expires_at,\n  device,\n  event_key: EVENT_KEY,\n});\n"
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// WF-C — POST /webhook/ls2026/auth   { pin, device } -> { session_token, expires_at }\n//\n// Rate limited per source IP: 5 attempts / 15 minutes (spec §10, §12.4).\n\nconst req = $input.first().json;\nconst method = (req.method || 'POST').toUpperCase();\nif (method === 'OPTIONS') return reply(204, {});\n\nconst body = req.body || {};\nconst headers = req.headers || {};\nconst ip = header(headers, 'x-forwarded-for') || header(headers, 'x-real-ip') || 'unknown';\nconst device = String(body.device || '').trim().slice(0, 40);\nconst pin = String(body.pin || '');\n\n// Throwing here would surface to the phone as an empty 200, which reads like a\n// broken scanner rather than an unconfigured server.\nlet configured;\ntry {\n  configured = secrets();\n} catch (_) {\n  return reply(503, { message: 'Check-in server is not configured yet. Seed the staff PIN in n8n.' });\n}\n\nconst store = $getWorkflowStaticData('global');\nstore.pinAttempts = store.pinAttempts || {};\n\nconst now = Date.now();\nconst record = store.pinAttempts[ip] || { count: 0, first: now };\nif (now - record.first > PIN_WINDOW_MS) {\n  record.count = 0;\n  record.first = now;\n}\n\nif (record.count >= PIN_MAX_ATTEMPTS) {\n  store.pinAttempts[ip] = record;\n  return reply(429, { message: 'Too many attempts. Wait 15 minutes.' });\n}\n\nif (!device) return reply(400, { message: 'Device label is required.' });\n\nif (!constantTimeEqual(pin, configured.pin)) {\n  record.count += 1;\n  store.pinAttempts[ip] = record;\n  return reply(401, { message: 'Wrong PIN.' });\n}\n\ndelete store.pinAttempts[ip];\n\n// Housekeeping: drop attempt records older than the window so the bag cannot\n// grow without bound across the event.\nfor (const [key, value] of Object.entries(store.pinAttempts)) {\n  if (now - value.first > PIN_WINDOW_MS) delete store.pinAttempts[key];\n}\n\nconst session = await issueSession(device);\nreturn reply(200, {\n  session_token: session.token,\n  expires_at: session.payload.expires_at,\n  device,\n  event_key: EVENT_KEY,\n});\n"
       }
     },
     {
@@ -109,17 +110,18 @@
         -320,
         300
       ],
-      "webhookId": "ls2026-roster",
+      "webhookId": "ls2026-cc-roster",
       "parameters": {
         "multipleMethods": true,
         "httpMethods": [
           "GET",
           "OPTIONS"
         ],
-        "path": "ls2026/roster",
+        "path": "ls2026-cc/roster",
         "responseMode": "responseNode",
         "options": {
-          "rawBody": false
+          "rawBody": false,
+          "allowedOrigins": "https://mes178.github.io"
         }
       }
     },
@@ -284,17 +286,18 @@
         -320,
         620
       ],
-      "webhookId": "ls2026-checkin",
+      "webhookId": "ls2026-cc-checkin",
       "parameters": {
         "multipleMethods": true,
         "httpMethods": [
           "POST",
           "OPTIONS"
         ],
-        "path": "ls2026/checkin",
+        "path": "ls2026-cc/checkin",
         "responseMode": "responseNode",
         "options": {
-          "rawBody": false
+          "rawBody": false,
+          "allowedOrigins": "https://mes178.github.io"
         }
       }
     },
@@ -486,6 +489,13 @@
             "type": "main",
             "index": 0
           }
+        ],
+        [
+          {
+            "node": "Authenticate",
+            "type": "main",
+            "index": 0
+          }
         ]
       ]
     },
@@ -502,6 +512,13 @@
     },
     "Roster webhook": {
       "main": [
+        [
+          {
+            "node": "Verify roster session",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Verify roster session",
@@ -586,6 +603,13 @@
     },
     "Checkin webhook": {
       "main": [
+        [
+          {
+            "node": "Plan check-ins",
+            "type": "main",
+            "index": 0
+          }
+        ],
         [
           {
             "node": "Plan check-ins",

@@ -74,7 +74,7 @@ def http_node(name, position, url, method="POST", json_body=None, extra=None, on
     return node
 
 
-def webhook_node(name, path, position, methods):
+def webhook_node(name, path, position, methods, origin):
     return {
         "id": name.lower().replace(" ", "-"),
         "name": name,
@@ -87,7 +87,10 @@ def webhook_node(name, path, position, methods):
             "httpMethods": methods,
             "path": path,
             "responseMode": "responseNode",
-            "options": {"rawBody": False},
+            # Without allowedOrigins, n8n answers the CORS preflight itself and
+            # echoes whatever Origin it was sent — verified against the live
+            # instance. That is the `*` the spec forbids, wearing a disguise.
+            "options": {"rawBody": False, "allowedOrigins": origin},
         },
     }
 
@@ -209,7 +212,7 @@ def build_issue_tokens():
     ]
 
     return {
-        "name": "LS2026 — Issue Tokens",
+        "name": "LS2026 (CC) — Issue Tokens",
         "nodes": nodes,
         "connections": wire(
             ("Every 3 minutes", "Find new registrants", 0),
@@ -245,12 +248,12 @@ def build_checkin_api(origin):
         code_node("Write secrets to store", read(SRC, "seed-secrets.js"), [-100, -160]),
 
         # --- WF-C auth
-        webhook_node("Auth webhook", "ls2026/auth", [-320, 60], ["POST", "OPTIONS"]),
+        webhook_node("Auth webhook", "ls2026-cc/auth", [-320, 60], ["POST", "OPTIONS"], origin),
         code_node("Authenticate", read(SRC, "api-auth.js"), [-100, 60], extra_prelude=prelude),
         respond_node("Respond auth", [340, 60]),
 
         # --- WF-D roster
-        webhook_node("Roster webhook", "ls2026/roster", [-320, 300], ["GET", "OPTIONS"]),
+        webhook_node("Roster webhook", "ls2026-cc/roster", [-320, 300], ["GET", "OPTIONS"], origin),
         code_node("Verify roster session", read(SRC, "api-roster-verify.js"), [-100, 300], extra_prelude=prelude),
         if_authorized("Roster authorized?", [120, 300]),
         http_node("Roster page 1", [340, 220],
@@ -266,7 +269,7 @@ def build_checkin_api(origin):
         respond_node("Respond roster", [1000, 300]),
 
         # --- WF-E check-in
-        webhook_node("Checkin webhook", "ls2026/checkin", [-320, 620], ["POST", "OPTIONS"]),
+        webhook_node("Checkin webhook", "ls2026-cc/checkin", [-320, 620], ["POST", "OPTIONS"], origin),
         code_node("Plan check-ins", read(SRC, "api-checkin-plan.js"), [-100, 620], extra_prelude=prelude),
         if_authorized("Checkin authorized?", [120, 620]),
         http_node(
@@ -290,15 +293,17 @@ def build_checkin_api(origin):
     ]
 
     return {
-        "name": "LS2026 — Check-In API",
+        "name": "LS2026 (CC) — Check-In API",
         "nodes": nodes,
         "connections": wire(
             ("Seed secrets", "Write secrets to store", 0),
 
             ("Auth webhook", "Authenticate", 0),
+            ("Auth webhook", "Authenticate", 1),
             ("Authenticate", "Respond auth", 0),
 
             ("Roster webhook", "Verify roster session", 0),
+            ("Roster webhook", "Verify roster session", 1),
             ("Verify roster session", "Roster authorized?", 0),
             ("Roster authorized?", "Roster page 1", 0),
             ("Roster authorized?", "Roster unauthorized", 1),
@@ -308,6 +313,7 @@ def build_checkin_api(origin):
             ("Roster unauthorized", "Respond roster", 0),
 
             ("Checkin webhook", "Plan check-ins", 0),
+            ("Checkin webhook", "Plan check-ins", 1),
             ("Plan check-ins", "Checkin authorized?", 0),
             ("Checkin authorized?", "Look up tokens", 0),
             ("Checkin authorized?", "Checkin unauthorized", 1),

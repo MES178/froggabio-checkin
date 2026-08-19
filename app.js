@@ -372,7 +372,27 @@
     return code ? code.data : null;
   }
 
-  async function onCode(value) {
+  /**
+   * Our own QR holds the bare token. Codes minted by other tooling may hold a
+   * URL with the token in a query parameter — accept those too rather than
+   * telling a guest with a valid code that they are not on the list.
+   */
+  function tokenFromScan(value) {
+    if (!/^https?:\/\//i.test(value)) return value;
+    try {
+      const params = new URL(value).searchParams;
+      for (const key of ['t', 'token', 'code']) {
+        const found = params.get(key);
+        if (found) return found;
+      }
+    } catch (_) {
+      /* not a parseable URL — fall through and try it as a raw token */
+    }
+    return value;
+  }
+
+  async function onCode(rawValue) {
+    const value = tokenFromScan(rawValue);
     const now = Date.now();
     if (value === state.lastScanValue && now - state.lastScanAt < CFG.resultDismissMs) return;
     state.lastScanValue = value;
