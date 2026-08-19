@@ -101,15 +101,36 @@ the readable sources in `n8n/src/`. **Edit the sources, never the JSON.**
 Import both into n8n, set the Header Auth credential on every HTTP Request node,
 then:
 
-1. Open **LS2026 — Check-In API** → node `Write secrets to store` → set
-   `STAFF_PIN` to the desk PIN → run the `Seed secrets` trigger once → **clear the
-   PIN from the node and save**. The PIN now lives in the workflow's static data,
-   not in any file.
-2. Activate both workflows.
-3. Note the three production webhook URLs and confirm they match `config.js`.
+1. Open **LS2026 (CC) — Check-In API** → node `Authenticate`. The first lines are:
 
-Rotating the PIN: set it again and re-run the seed. Signing every phone out:
-delete `hmacSecret` from static data and re-run the seed.
+   ```js
+   // SET THE DESK PIN HERE, then save the workflow.
+   const STAFF_PIN = '';
+   ```
+
+   Put the desk PIN between the quotes and save. That is the only place it exists.
+   `scripts/deploy_n8n.py` reads the live value back and re-injects it, so a
+   redeploy never signs the desk out.
+
+2. Activate the Check-In API. Leave the token issuer inactive until the question
+   in "Parallel stack" below is settled.
+3. Confirm the webhook URLs match `config.js`.
+
+Rotating the PIN: edit that line and save. Signing every phone out immediately:
+delete `.ls2026-hmac-secret` and redeploy — every existing session stops verifying.
+
+### Why the PIN is a constant and not static data
+
+The first design seeded the PIN and the signing secret into n8n static data from
+a manual trigger. That silently cannot work: **n8n discards static data written
+during a manual test run** — only production executions persist it. The trigger
+reported success and stored nothing, and `/auth` kept answering 503.
+
+Static data is still used for the PIN rate limiter and the replay guard, which are
+only ever written by production executions.
+
+The session-signing secret lives in `.ls2026-hmac-secret` (gitignored, mode 600)
+and is injected at deploy; the committed JSON carries `__HMAC_SECRET__`.
 
 ## 6. Confirmation email
 

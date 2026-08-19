@@ -8,18 +8,18 @@
 // load npm packages inside a Code node, and no third-party QR service may ever
 // see a customer identifier (spec §7.3).
 
-const item = $input.first().json;
+// runOnceForEachItem: $input.first() is rejected here, and the node must
+// return a single object rather than an array.
+const item = $input.item.json;
 const { bytes, size, modules } = buildQrPng(item.token, { minPx: 600, quiet: 4, ecc: 'M' });
 
-return [
-  {
-    json: { ...item, qr_px: size, qr_modules: modules },
-    binary: {
-      data: await this.helpers.prepareBinaryData(
-        Buffer.from(bytes),
-        `${item.event_key}-${item.short_code}.png`,
-        'image/png'
-      ),
-    },
+return {
+  json: { ...item, qr_px: size, qr_modules: modules },
+  binary: {
+    data: await this.helpers.prepareBinaryData(
+      Buffer.from(bytes),
+      `${item.event_key}-${item.short_code}.png`,
+      'image/png'
+    ),
   },
-];
+};

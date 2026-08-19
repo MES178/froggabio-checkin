@@ -15,6 +15,8 @@ Usage:
 import argparse
 import json
 import os
+import re
+import secrets as pysecrets
 import sys
 import urllib.error
 import urllib.request
@@ -24,6 +26,8 @@ ENV_FILE = "/Users/eugenemartynov/Documents/claude_code/.env"
 SECRETS_FILE = "/Users/eugenemartynov/Documents/codex/_secret/.api.env"
 
 CREDENTIAL_NAME = "HubSpot Private App (LS2026 CC)"
+HMAC_FILE = os.path.join(ROOT, ".ls2026-hmac-secret")
+PIN_LINE = re.compile(r"^const STAFF_PIN = '([^']*)';$", re.MULTILINE)
 NAME_PREFIX = "LS2026 (CC)"
 WORKFLOWS = ["WF-A-issue-tokens.json", "WF-API-checkin.json"]
 
@@ -101,6 +105,48 @@ def existing_workflows():
     return {w["name"]: w for w in body.get("data", [])}
 
 
+def hmac_secret():
+    """The session-signing secret. Local, gitignored, never committed."""
+    if os.path.exists(HMAC_FILE):
+        with open(HMAC_FILE, encoding="utf-8") as fh:
+            value = fh.read().strip()
+        if value:
+            return value
+    value = pysecrets.token_hex(32)
+    with open(HMAC_FILE, "w", encoding="utf-8") as fh:
+        fh.write(value)
+    os.chmod(HMAC_FILE, 0o600)
+    print(f"hmac secret: generated and stored in {os.path.basename(HMAC_FILE)}")
+    return value
+
+
+def live_pin(existing_workflow):
+    """Read the PIN the operator set in the n8n editor so a redeploy keeps it.
+
+    The value is moved from the live node into the new one and is never printed.
+    """
+    if not existing_workflow:
+        return None
+    for node in existing_workflow.get("nodes", []):
+        if node.get("name") == "Authenticate":
+            match = PIN_LINE.search(node.get("parameters", {}).get("jsCode", ""))
+            if match:
+                return match.group(1)
+    return None
+
+
+def inject_secrets(workflow, secret, pin):
+    for node in workflow["nodes"]:
+        code = node.get("parameters", {}).get("jsCode")
+        if not code:
+            continue
+        code = code.replace("__HMAC_SECRET__", secret)
+        if pin and node["name"] == "Authenticate":
+            code = PIN_LINE.sub(f"const STAFF_PIN = '{pin}';", code, count=1)
+        node["parameters"]["jsCode"] = code
+    return workflow
+
+
 def wire_credential(workflow, credential_id):
     for node in workflow["nodes"]:
         creds = node.get("credentials")
@@ -116,6 +162,7 @@ def main():
     args = parser.parse_args()
 
     credential_id = ensure_credential()
+    secret = hmac_secret()
     existing = existing_workflows()
 
     for filename in WORKFLOWS:
@@ -126,6 +173,7 @@ def main():
         if not name.startswith(NAME_PREFIX):
             sys.exit(f"REFUSING: {name!r} is not one of ours")
 
+        workflow = inject_secrets(workflow, secret, None)
         payload = {
             "name": name,
             "nodes": workflow["nodes"],
@@ -135,6 +183,16 @@ def main():
 
         if name in existing:
             wid = existing[name]["id"]
+            status, live = api("GET", f"/api/v1/workflows/{wid}")
+            pin = live_pin(live if status == 200 else None)
+            workflow = inject_secrets(workflow, secret, pin)
+            payload = {
+                "name": name,
+                "nodes": workflow["nodes"],
+                "connections": workflow["connections"],
+                "settings": workflow.get("settings", {}),
+            }
+            print(f"   desk PIN: {'preserved from live workflow' if pin else 'NOT SET — set it in the n8n editor'}")
             status, body = api("PUT", f"/api/v1/workflows/{wid}", payload)
             action = "updated"
         else:

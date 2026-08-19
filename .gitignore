@@ -3,3 +3,4 @@
 .DS_Store
 node_modules/
 .n8n-credential-id
+.ls2026-hmac-secret

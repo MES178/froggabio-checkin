@@ -12,13 +12,8 @@ const ip = header(headers, 'x-forwarded-for') || header(headers, 'x-real-ip') ||
 const device = String(body.device || '').trim().slice(0, 40);
 const pin = String(body.pin || '');
 
-// Throwing here would surface to the phone as an empty 200, which reads like a
-// broken scanner rather than an unconfigured server.
-let configured;
-try {
-  configured = secrets();
-} catch (_) {
-  return reply(503, { message: 'Check-in server is not configured yet. Seed the staff PIN in n8n.' });
+if (!STAFF_PIN || !HMAC_SECRET) {
+  return reply(503, { message: 'Check-in server is not configured yet. Set the desk PIN in n8n.' });
 }
 
 const store = $getWorkflowStaticData('global');
@@ -38,7 +33,7 @@ if (record.count >= PIN_MAX_ATTEMPTS) {
 
 if (!device) return reply(400, { message: 'Device label is required.' });
 
-if (!constantTimeEqual(pin, configured.pin)) {
+if (!constantTimeEqual(pin, STAFF_PIN)) {
   record.count += 1;
   store.pinAttempts[ip] = record;
   return reply(401, { message: 'Wrong PIN.' });

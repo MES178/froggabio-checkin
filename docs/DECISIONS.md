@@ -56,7 +56,7 @@ before the invitations go out.
 
 ## Found on the live instance
 
-Three things only showed up once the workflows were running against real n8n:
+Five things only showed up once the workflows were running against real n8n:
 
 **A multi-method webhook has one output per method, and n8n picks their order —
 not you.** `httpMethods: ["POST", "OPTIONS"]` put POST on output *1*, so wiring
@@ -68,6 +68,17 @@ output is now wired to the same handler, which is correct whatever the ordering.
 is blocked — but plain `require('crypto')` is allowed and gives `randomUUID`,
 `randomBytes` and `createHmac`. Session signing, token minting and secret seeding
 all use that now, verified by probing the live sandbox.
+
+**Static data written during a manual execution is discarded.** The original
+design seeded the staff PIN and the signing secret from a manual trigger; the run
+reported success and persisted nothing, so `/auth` stayed 503. Secrets are now
+constants — the PIN edited in the `Authenticate` node, the signing secret injected
+at deploy from a gitignored file. Static data still carries the rate limiter and
+replay guard, which only production executions write.
+
+**A Code node in "run once for each item" mode rejects `$input.first()`** and must
+return a single object rather than an array. Both per-item nodes in the issuer hit
+this ("Can't use .first() here") and now use `$input.item`.
 
 **n8n answers the CORS preflight itself and echoes whatever Origin it is sent.**
 Verified: a preflight from `https://evil.example.com` came back with
@@ -87,11 +98,31 @@ is deployed **inactive**. Their QR holds a URL rather than a bare token, so this
 scanner now also accepts a token in a `t`/`token`/`code` query parameter and will
 read codes from either stack.
 
+## Verified end to end, against live HubSpot and live n8n
+
+- A test registrant was issued a token, an unambiguous short code and a QR PNG
+  uploaded to HubSpot File Manager; the PNG downloaded from HubSpot's CDN decodes
+  back to exactly that contact's token.
+- Sign-in, roster download and check-in all work from the published scanner.
+- A check-in writes `attended` with the **client's** scan time, method and device.
+- A second scan from another desk returns `already_checked_in` with the original
+  time and desk, and does not overwrite.
+- A retried batch is recognised by `scan_id` and applied once.
+- An unrelated code returns `not_found`; undo returns the contact to `registered`
+  and clears the timestamp.
+- Offline: with every network call failing, the scan showed green instantly, the
+  queue went to 1, and on reconnect it drained to 0 and landed in HubSpot **with
+  the time of the scan, not the time of the sync**.
+
+Test data was cleaned up afterwards: the temporary PIN was removed, and the test
+contact's `ls2026_*` properties were cleared. The contact
+`ls2026.pipeline.test@example.com` (id 243045909886) and one QR file under
+`/event-checkin/ls2026/` still exist — delete them if you would rather they did not.
+
 ## Still open
 
-- **The staff PIN is not seeded**, so `/auth` answers 503 by design. One run of
-  the `Seed secrets` trigger in n8n fixes it; nobody but the marketing lead should
-  ever type that PIN.
+- **The staff PIN is not set**, so `/auth` answers 503 by design. It is one line
+  in the `Authenticate` node; nobody but the marketing lead should type it.
 - **The confirmation email and the landing page are not built yet.** Event
   details are now settled: Life Science Event, Tuesday 6 October 2026, 6:00 PM,
   Jewel Box at MaRS Discovery District, 101 College Street, Toronto, ON M5G 0A3.

@@ -226,8 +226,29 @@ def build_issue_tokens():
     }
 
 
+# Replaced by scripts/deploy_n8n.py at deploy time. The committed JSON only ever
+# carries the placeholder.
+HMAC_PLACEHOLDER = "__HMAC_SECRET__"
+
+# The one place the desk PIN lives. The operator edits this line in the n8n
+# editor; deploy_n8n.py reads the live value back and preserves it, so a redeploy
+# never silently signs every phone out.
+PIN_BLOCK = """// ============================================================================
+// SET THE DESK PIN HERE, then save the workflow.
+// This is the only place the PIN exists. Redeploys preserve whatever is set.
+const STAFF_PIN = '';
+// ============================================================================
+
+"""
+
+
 def build_checkin_api(origin):
-    prelude = f"const ALLOWED_ORIGIN = {json.dumps(origin)};\n" + read(SRC, "lib-session.js") + "\n"
+    prelude = (
+        f"const ALLOWED_ORIGIN = {json.dumps(origin)};\n"
+        f"const HMAC_SECRET = {json.dumps(HMAC_PLACEHOLDER)};\n"
+        + read(SRC, "lib-session.js")
+        + "\n"
+    )
 
     roster_search = json.dumps({
         "filterGroups": [{"filters": [{"propertyName": "ls2026_token", "operator": "HAS_PROPERTY"}]}],
@@ -236,20 +257,10 @@ def build_checkin_api(origin):
     })
 
     nodes = [
-        # --- one-off secret seeding, so the PIN and HMAC secret never live in this file
-        {
-            "id": "seed-trigger",
-            "name": "Seed secrets",
-            "type": "n8n-nodes-base.manualTrigger",
-            "typeVersion": 1,
-            "position": [-320, -160],
-            "parameters": {},
-        },
-        code_node("Write secrets to store", read(SRC, "seed-secrets.js"), [-100, -160]),
-
         # --- WF-C auth
         webhook_node("Auth webhook", "ls2026-cc/auth", [-320, 60], ["POST", "OPTIONS"], origin),
-        code_node("Authenticate", read(SRC, "api-auth.js"), [-100, 60], extra_prelude=prelude),
+        code_node("Authenticate", read(SRC, "api-auth.js"), [-100, 60],
+                  extra_prelude=PIN_BLOCK + prelude),
         respond_node("Respond auth", [340, 60]),
 
         # --- WF-D roster
@@ -296,8 +307,6 @@ def build_checkin_api(origin):
         "name": "LS2026 (CC) — Check-In API",
         "nodes": nodes,
         "connections": wire(
-            ("Seed secrets", "Write secrets to store", 0),
-
             ("Auth webhook", "Authenticate", 0),
             ("Auth webhook", "Authenticate", 1),
             ("Authenticate", "Respond auth", 0),

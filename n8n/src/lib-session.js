@@ -1,21 +1,18 @@
 // Shared helpers, inlined into every Code node by scripts/build_workflows.py.
 //
-// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded
-// once by the "Seed secrets" manual trigger. They are therefore NOT in the
-// exported JSON that gets committed — see docs/SETUP.md.
+// HMAC_SECRET and ALLOWED_ORIGIN are injected above this by the deploy script.
+// They are NOT in the committed JSON — the build writes a placeholder and
+// scripts/deploy_n8n.py substitutes the real value from a gitignored local file.
+//
+// Static data is still used for the PIN rate limiter and the replay guard, which
+// is safe: those are only ever written by production executions. Secrets cannot
+// live there — n8n discards static data written during a manual test run, so
+// there is no way to seed it by hand.
 
 const EVENT_KEY = 'ls2026';
 const SESSION_TTL_HOURS = 24;
 const PIN_MAX_ATTEMPTS = 5;
 const PIN_WINDOW_MS = 15 * 60 * 1000;
-
-function secrets() {
-  const store = $getWorkflowStaticData('global');
-  if (!store.pin || !store.hmacSecret) {
-    throw new Error('Secrets are not seeded. Run the "Seed secrets" trigger once.');
-  }
-  return store;
-}
 
 // The Code-node sandbox has no `crypto` global and forbids 'node:crypto',
 // but plain require('crypto') is allowed — verified against the live instance.
@@ -45,7 +42,7 @@ function issueSession(device) {
     expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),
   };
   const body = b64url(Buffer.from(JSON.stringify(payload), 'utf8'));
-  const sig = b64url(hmac(secrets().hmacSecret, body));
+  const sig = b64url(hmac(HMAC_SECRET, body));
   return { token: `${body}.${sig}`, payload };
 }
 
@@ -53,12 +50,8 @@ function issueSession(device) {
 function verifySession(token) {
   if (!token || typeof token !== 'string' || !token.includes('.')) return null;
   const [body, sig] = token.split('.');
-  let expected;
-  try {
-    expected = b64url(hmac(secrets().hmacSecret, body));
-  } catch (_) {
-    return null;
-  }
+  if (!HMAC_SECRET) return null;
+  const expected = b64url(hmac(HMAC_SECRET, body));
   if (!constantTimeEqual(sig, expected)) return null;
   let payload;
   try {

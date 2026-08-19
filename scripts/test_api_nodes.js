@@ -13,7 +13,16 @@ const vm = require('vm');
 
 const ROOT = path.join(__dirname, '..');
 const workflow = JSON.parse(fs.readFileSync(path.join(ROOT, 'n8n/WF-API-checkin.json'), 'utf8'));
-const bodyOf = (name) => workflow.nodes.find((n) => n.name === name).parameters.jsCode;
+// Secrets are constants in the node bodies now, filled in at deploy time. The
+// tests fill in their own so they exercise exactly the shipped code.
+const TEST_PIN = '4821';
+const TEST_SECRET = 'test-secret-not-used-anywhere-real';
+
+const bodyOf = (name) =>
+  workflow.nodes
+    .find((n) => n.name === name)
+    .parameters.jsCode.replace(/__HMAC_SECRET__/g, TEST_SECRET)
+    .replace(/^const STAFF_PIN = '[^']*';$/m, `const STAFF_PIN = '${TEST_PIN}';`);
 
 const staticData = {};
 let failures = 0;
@@ -53,19 +62,10 @@ async function runNode(name, { input, nodeOutputs = {} }) {
 }
 
 (async () => {
-  // ---- seed secrets -------------------------------------------------------
-  const seedBody = bodyOf('Write secrets to store').replace("const STAFF_PIN = '';", "const STAFF_PIN = '4821';");
-  const seedCtx = {
-    $getWorkflowStaticData: () => staticData,
-    require: (name) => {
-      if (name === 'crypto') return require('crypto');
-      throw new Error(`Module '${name}' is disallowed`);
-    },
-    console,
-  };
-  seedCtx.globalThis = seedCtx;
-  vm.runInNewContext(`(function(){${seedBody}})`, seedCtx)();
-  check('secrets seeded', staticData.pin === '4821' && staticData.hmacSecret.length === 64);
+  check('PIN and signing secret are wired into the node bodies',
+    bodyOf('Authenticate').includes(`const STAFF_PIN = '${TEST_PIN}'`) &&
+    bodyOf('Authenticate').includes(TEST_SECRET) &&
+    !bodyOf('Verify roster session').includes('__HMAC_SECRET__'));
 
   const authReq = (pin, ip = '1.2.3.4') => [
     { method: 'POST', headers: { 'X-Forwarded-For': ip }, body: { pin, device: 'Desk 1' } },
@@ -81,7 +81,7 @@ async function runNode(name, { input, nodeOutputs = {} }) {
   check('sixth attempt is rate limited (429)', statuses[5] === 429);
 
   // ---- correct PIN from a different IP still works ------------------------
-  const good = await runNode('Authenticate', { input: authReq('4821', '9.9.9.9') });
+  const good = await runNode('Authenticate', { input: authReq(TEST_PIN, '9.9.9.9') });
   const session = good[0].json.body.session_token;
   check('correct PIN issues a session', good[0].json.statusCode === 200 && Boolean(session));
   check('CORS header is the exact Pages origin, not *',
@@ -110,7 +110,7 @@ async function runNode(name, { input, nodeOutputs = {} }) {
     Buffer.from(JSON.stringify({ device: 'Desk 1', expires_at: new Date(Date.now() - 1000).toISOString() }))
   );
   const expiredSig = b64url(
-    require('crypto').createHmac('sha256', staticData.hmacSecret).update(expiredBody).digest()
+    require('crypto').createHmac('sha256', TEST_SECRET).update(expiredBody).digest()
   );
   check('expired session is rejected', !(await verify(`${expiredBody}.${expiredSig}`)));
 
