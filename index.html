@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#101418">
+<title>Event Check-In — FroggaBio</title>
+<link rel="manifest" href="manifest.json">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<header id="topbar">
+  <span class="brand">FroggaBio</span>
+  <span id="event-name" class="event"></span>
+  <button id="btn-menu" class="ghost" hidden>Menu</button>
+</header>
+
+<!-- 1. LOGIN -->
+<section id="screen-login" class="screen active">
+  <h1>Registration desk</h1>
+  <label for="device">Device label</label>
+  <input id="device" type="text" autocomplete="off" placeholder="Desk 1" enterkeyhint="next">
+  <label for="pin">Staff PIN</label>
+  <input id="pin" type="password" inputmode="numeric" autocomplete="off" enterkeyhint="go">
+  <button id="btn-login" class="primary">Sign in</button>
+  <p id="login-error" class="error" role="alert"></p>
+</section>
+
+<!-- 2. PREPARE -->
+<section id="screen-prepare" class="screen">
+  <h1>Before doors open</h1>
+  <div id="roster-warning" class="warning">
+    <strong>No door list on this device.</strong>
+    Download it now, while you have good Wi-Fi. Without it the scanner cannot check anyone in offline.
+  </div>
+  <div id="roster-state" class="card">
+    <div class="stat"><span id="roster-count">0</span> attendees</div>
+    <div class="muted">Last sync: <span id="roster-synced">never</span></div>
+  </div>
+  <button id="btn-roster" class="primary">Download door list</button>
+  <button id="btn-to-scan" class="secondary">Go to scanning</button>
+  <p id="prepare-msg" class="muted" role="status"></p>
+</section>
+
+<!-- 3. SCAN -->
+<section id="screen-scan" class="screen">
+  <div id="camera-wrap">
+    <video id="video" playsinline muted></video>
+    <canvas id="frame" hidden></canvas>
+    <button id="btn-start-camera" class="primary big">Start scanning</button>
+  </div>
+</section>
+
+<!-- 4. SEARCH -->
+<section id="screen-search" class="screen">
+  <h1>Find an attendee</h1>
+  <input id="search-input" type="search" autocomplete="off" placeholder="Name, email, company or code">
+  <ul id="search-results" class="list"></ul>
+</section>
+
+<!-- 5. DOOR LIST -->
+<section id="screen-list" class="screen">
+  <h1>Door list</h1>
+  <div class="filters">
+    <button class="filter active" data-filter="all">All</button>
+    <button class="filter" data-filter="in">Checked in</button>
+    <button class="filter" data-filter="out">Not yet</button>
+  </div>
+  <ul id="door-list" class="list"></ul>
+</section>
+
+<!-- 6. SETTINGS -->
+<section id="screen-settings" class="screen">
+  <h1>Settings</h1>
+  <div class="card">
+    <div class="muted">Signed in as</div>
+    <div class="stat" id="settings-device">—</div>
+  </div>
+  <button id="btn-resync" class="secondary">Re-download door list</button>
+  <button id="btn-clear" class="danger">Clear local data</button>
+  <p class="muted">
+    Clearing removes the door list and every queued scan from this phone. Do this
+    after the event — and never while the queue is above zero.
+  </p>
+  <button id="btn-logout" class="secondary">Sign out</button>
+</section>
+
+<!-- Scan result. Lives at body level, not inside the scan screen, so a manual
+     check-in from Search or Door list gets the same unmissable confirmation. -->
+<div id="result" class="result" hidden>
+  <div id="result-icon" class="result-icon"></div>
+  <div id="result-name" class="result-name"></div>
+  <div id="result-company" class="result-company"></div>
+  <div id="result-note" class="result-note"></div>
+</div>
+
+<!-- confirmation dialog for manual check-in / undo -->
+<div id="confirm" class="sheet" hidden>
+  <div class="sheet-body">
+    <div id="confirm-title" class="sheet-title"></div>
+    <div id="confirm-text" class="muted"></div>
+    <div class="sheet-actions">
+      <button id="confirm-no" class="secondary">Cancel</button>
+      <button id="confirm-yes" class="primary">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<footer id="statusbar" hidden>
+  <span id="status-counts">Checked in: 0 / 0</span>
+  <span id="status-queue">Queue: 0</span>
+  <span id="status-net" class="online">Online</span>
+</footer>
+
+<nav id="tabs" hidden>
+  <button class="tab active" data-screen="scan">Scan</button>
+  <button class="tab" data-screen="search">Search</button>
+  <button class="tab" data-screen="list">Door list</button>
+  <button class="tab" data-screen="settings">Settings</button>
+</nav>
+
+<script src="config.js"></script>
+<script src="vendor/jsQR.min.js"></script>
+<script src="db.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,687 @@
+{
+  "name": "LS2026 — Check-In API",
+  "nodes": [
+    {
+      "id": "seed-trigger",
+      "name": "Seed secrets",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        -320,
+        -160
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "write-secrets-to-store",
+      "name": "Write secrets to store",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        -160
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Run this ONCE from the n8n editor (\"Test step\" on the Seed secrets trigger).\n//\n// Why here and not in the node parameters: whatever is written in a node body\n// ends up in the exported JSON we commit. Static data does not — so the staff\n// PIN and the session-signing secret exist only inside the running n8n instance.\n//\n// Set STAFF_PIN below, run the node once, then blank it out and save again.\n// Re-running with a new PIN rotates it; rotating HMAC_SECRET signs every phone\n// out immediately, which is the revocation lever from spec §12.3.\n\nconst STAFF_PIN = ''; // <- put the desk PIN here for one run, then clear it\n\nconst store = $getWorkflowStaticData('global');\n\nif (STAFF_PIN) {\n  store.pin = STAFF_PIN;\n}\nif (!store.hmacSecret) {\n  const bytes = new Uint8Array(32);\n  crypto.getRandomValues(bytes);\n  store.hmacSecret = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');\n}\n\nreturn [\n  {\n    json: {\n      pin_set: Boolean(store.pin),\n      hmac_secret_set: Boolean(store.hmacSecret),\n      note: 'Clear STAFF_PIN from this node and save the workflow.',\n    },\n  },\n];\n"
+      }
+    },
+    {
+      "id": "auth-webhook",
+      "name": "Auth webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        60
+      ],
+      "webhookId": "ls2026-auth",
+      "parameters": {
+        "multipleMethods": true,
+        "httpMethods": [
+          "POST",
+          "OPTIONS"
+        ],
+        "path": "ls2026/auth",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      }
+    },
+    {
+      "id": "authenticate",
+      "name": "Authenticate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        60
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// WF-C — POST /webhook/ls2026/auth   { pin, device } -> { session_token, expires_at }\n//\n// Rate limited per source IP: 5 attempts / 15 minutes (spec §10, §12.4).\n\nconst req = $input.first().json;\nconst method = (req.method || 'POST').toUpperCase();\nif (method === 'OPTIONS') return reply(204, {});\n\nconst body = req.body || {};\nconst headers = req.headers || {};\nconst ip = header(headers, 'x-forwarded-for') || header(headers, 'x-real-ip') || 'unknown';\nconst device = String(body.device || '').trim().slice(0, 40);\nconst pin = String(body.pin || '');\n\nconst store = $getWorkflowStaticData('global');\nstore.pinAttempts = store.pinAttempts || {};\n\nconst now = Date.now();\nconst record = store.pinAttempts[ip] || { count: 0, first: now };\nif (now - record.first > PIN_WINDOW_MS) {\n  record.count = 0;\n  record.first = now;\n}\n\nif (record.count >= PIN_MAX_ATTEMPTS) {\n  store.pinAttempts[ip] = record;\n  return reply(429, { message: 'Too many attempts. Wait 15 minutes.' });\n}\n\nif (!device) return reply(400, { message: 'Device label is required.' });\n\nif (!constantTimeEqual(pin, secrets().pin)) {\n  record.count += 1;\n  store.pinAttempts[ip] = record;\n  return reply(401, { message: 'Wrong PIN.' });\n}\n\ndelete store.pinAttempts[ip];\n\n// Housekeeping: drop attempt records older than the window so the bag cannot\n// grow without bound across the event.\nfor (const [key, value] of Object.entries(store.pinAttempts)) {\n  if (now - value.first > PIN_WINDOW_MS) delete store.pinAttempts[key];\n}\n\nconst session = await issueSession(device);\nreturn reply(200, {\n  session_token: session.token,\n  expires_at: session.payload.expires_at,\n  device,\n  event_key: EVENT_KEY,\n});\n"
+      }
+    },
+    {
+      "id": "respond-auth",
+      "name": "Respond auth",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        340,
+        60
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "responseCode": "={{ $json.statusCode }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "={{ $json.headers['Access-Control-Allow-Origin'] }}"
+              },
+              {
+                "name": "Access-Control-Allow-Headers",
+                "value": "Content-Type, X-Session-Token"
+              },
+              {
+                "name": "Access-Control-Allow-Methods",
+                "value": "GET, POST, OPTIONS"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "roster-webhook",
+      "name": "Roster webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        300
+      ],
+      "webhookId": "ls2026-roster",
+      "parameters": {
+        "multipleMethods": true,
+        "httpMethods": [
+          "GET",
+          "OPTIONS"
+        ],
+        "path": "ls2026/roster",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      }
+    },
+    {
+      "id": "verify-roster-session",
+      "name": "Verify roster session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// WF-D step 1 — authorise before any HubSpot call or any PII leaves the box.\n\nconst req = $input.first().json;\nconst method = (req.method || 'GET').toUpperCase();\nif (method === 'OPTIONS') return [{ json: { authorized: false, preflight: true } }];\n\nconst session = await verifySession(header(req.headers, 'x-session-token'));\nreturn [{ json: { authorized: Boolean(session), device: session ? session.device : null } }];\n"
+      }
+    },
+    {
+      "id": "roster-authorized?",
+      "name": "Roster authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        120,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.authorized }}",
+              "value2": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "roster-page-1",
+      "name": "Roster page 1",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        340,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "{\"filterGroups\": [{\"filters\": [{\"propertyName\": \"ls2026_token\", \"operator\": \"HAS_PROPERTY\"}]}], \"properties\": [\"email\", \"firstname\", \"lastname\", \"company\", \"jobtitle\", \"ls2026_token\", \"ls2026_short_code\", \"ls2026_status\", \"ls2026_checked_in_at\", \"ls2026_checkin_method\", \"ls2026_checkin_device\"], \"limit\": 100}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "HubSpot Private App (LS2026)"
+        }
+      }
+    },
+    {
+      "id": "roster-page-2",
+      "name": "Roster page 2",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        560,
+        220
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify(Object.assign({\"filterGroups\": [{\"filters\": [{\"propertyName\": \"ls2026_token\", \"operator\": \"HAS_PROPERTY\"}]}], \"properties\": [\"email\", \"firstname\", \"lastname\", \"company\", \"jobtitle\", \"ls2026_token\", \"ls2026_short_code\", \"ls2026_status\", \"ls2026_checked_in_at\", \"ls2026_checkin_method\", \"ls2026_checkin_device\"], \"limit\": 100}, { after: $json.paging?.next?.after })) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "HubSpot Private App (LS2026)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "build-roster",
+      "name": "Build roster",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        780,
+        220
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// WF-D step 2 — shape the HubSpot search results into the door list.\n//\n// Two search pages are fetched (100 each). Anything beyond 200 registrants is\n// reported honestly via roster_truncated rather than silently dropped.\n\nconst pages = $input.all();\nconst seen = new Set();\nconst attendees = [];\nlet total = 0;\n\nfor (const page of pages) {\n  const body = page.json || {};\n  if (body.error || !Array.isArray(body.results)) continue; // page 2 is absent when page 1 was the last\n  total = Math.max(total, body.total || 0);\n  for (const contact of body.results) {\n    const p = contact.properties || {};\n    if (!p.ls2026_token || seen.has(contact.id)) continue;\n    seen.add(contact.id);\n    attendees.push({\n      hs_id: contact.id,\n      token: p.ls2026_token,\n      short_code: p.ls2026_short_code || '',\n      first_name: p.firstname || '',\n      last_name: p.lastname || '',\n      company: p.company || '',\n      email: p.email || '',\n      status: p.ls2026_status || 'registered',\n      checked_in_at: p.ls2026_checked_in_at || null,\n      checkin_device: p.ls2026_checkin_device || null,\n    });\n  }\n}\n\nreturn reply(200, {\n  event_key: EVENT_KEY,\n  generated_at: new Date().toISOString(),\n  count: attendees.length,\n  total_in_hubspot: total,\n  roster_truncated: total > attendees.length,\n  attendees,\n});\n"
+      }
+    },
+    {
+      "id": "roster-unauthorized",
+      "name": "Roster unauthorized",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        380
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// Shared 401 branch. Also answers the CORS preflight, which carries no session.\n\nconst input = $input.first().json || {};\nif (input.preflight) return reply(204, {});\nreturn reply(401, { message: 'Sign in again.' });\n"
+      }
+    },
+    {
+      "id": "respond-roster",
+      "name": "Respond roster",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1000,
+        300
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "responseCode": "={{ $json.statusCode }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "={{ $json.headers['Access-Control-Allow-Origin'] }}"
+              },
+              {
+                "name": "Access-Control-Allow-Headers",
+                "value": "Content-Type, X-Session-Token"
+              },
+              {
+                "name": "Access-Control-Allow-Methods",
+                "value": "GET, POST, OPTIONS"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "checkin-webhook",
+      "name": "Checkin webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -320,
+        620
+      ],
+      "webhookId": "ls2026-checkin",
+      "parameters": {
+        "multipleMethods": true,
+        "httpMethods": [
+          "POST",
+          "OPTIONS"
+        ],
+        "path": "ls2026/checkin",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": false
+        }
+      }
+    },
+    {
+      "id": "plan-check-ins",
+      "name": "Plan check-ins",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -100,
+        620
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// WF-E step 1 — authorise the batch and work out which tokens to look up.\n//\n// The scanner may drain several offline scans at once. scan_id makes a retried\n// batch harmless: anything already applied is remembered in static data.\n\nconst req = $input.first().json;\nconst method = (req.method || 'POST').toUpperCase();\nif (method === 'OPTIONS') return [{ json: { authorized: false, preflight: true, tokens: [] } }];\n\nconst session = await verifySession(header(req.headers, 'x-session-token'));\nif (!session) return [{ json: { authorized: false, tokens: [], scans: [] } }];\n\nconst scans = Array.isArray((req.body || {}).scans) ? req.body.scans : [];\nconst store = $getWorkflowStaticData('global');\nstore.appliedScans = store.appliedScans || {};\n\n// Keep the replay guard from growing forever: entries older than 48h are gone.\nconst cutoff = Date.now() - 48 * 3600 * 1000;\nfor (const [id, at] of Object.entries(store.appliedScans)) {\n  if (at < cutoff) delete store.appliedScans[id];\n}\n\nconst clean = [];\nfor (const scan of scans.slice(0, 200)) {\n  if (!scan || !scan.scan_id || !scan.token) continue;\n  clean.push({\n    scan_id: String(scan.scan_id),\n    action: scan.action === 'undo' ? 'undo' : 'checkin',\n    token: String(scan.token),\n    scanned_at: scan.scanned_at || new Date().toISOString(),\n    method: ['qr', 'manual_search', 'short_code'].includes(scan.method) ? scan.method : 'qr',\n    device: String(scan.device || session.device || '').slice(0, 40),\n    replay: Boolean(store.appliedScans[String(scan.scan_id)]),\n  });\n}\n\nconst tokens = [...new Set(clean.filter((s) => !s.replay).map((s) => s.token))];\nreturn [{ json: { authorized: true, device: session.device, scans: clean, tokens } }];\n"
+      }
+    },
+    {
+      "id": "checkin-authorized?",
+      "name": "Checkin authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [
+        120,
+        620
+      ],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.authorized }}",
+              "value2": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "look-up-tokens",
+      "name": "Look up tokens",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        340,
+        540
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ filterGroups: [{ filters: [{ propertyName: 'ls2026_token', operator: 'IN', values: $json.tokens }] }], properties: [\"email\", \"firstname\", \"lastname\", \"company\", \"jobtitle\", \"ls2026_token\", \"ls2026_short_code\", \"ls2026_status\", \"ls2026_checked_in_at\", \"ls2026_checkin_method\", \"ls2026_checkin_device\"], limit: 100 }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "HubSpot Private App (LS2026)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "decide-check-ins",
+      "name": "Decide check-ins",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        540
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// WF-E step 2 — decide each scan against HubSpot, and build one batch update.\n//\n// Rules (spec §10 WF-E):\n//   not found            -> report, write nothing\n//   already checked in   -> report the ORIGINAL time and device, never overwrite\n//   otherwise            -> attended, with the CLIENT's scanned_at (the scan may\n//                           have happened offline an hour ago)\n\nconst plan = $('Plan check-ins').first().json;\nconst scans = plan.scans || [];\n\nconst byToken = new Map();\nfor (const item of $input.all()) {\n  const body = item.json || {};\n  if (!Array.isArray(body.results)) continue;\n  for (const contact of body.results) {\n    const token = (contact.properties || {}).ls2026_token;\n    if (token) byToken.set(token, contact);\n  }\n}\n\nconst results = [];\nconst updates = new Map(); // hs_id -> properties, so two scans of one person collapse\n\nfor (const scan of scans) {\n  if (scan.replay) {\n    results.push({ scan_id: scan.scan_id, token: scan.token, result: 'applied' });\n    continue;\n  }\n\n  const contact = byToken.get(scan.token);\n  if (!contact) {\n    results.push({ scan_id: scan.scan_id, token: scan.token, result: 'not_found' });\n    continue;\n  }\n\n  const props = contact.properties || {};\n\n  if (scan.action === 'undo') {\n    updates.set(contact.id, {\n      ls2026_status: 'registered',\n      ls2026_checked_in_at: '',\n      ls2026_checkin_method: '',\n      ls2026_checkin_device: '',\n    });\n    results.push({ scan_id: scan.scan_id, token: scan.token, result: 'undone' });\n    continue;\n  }\n\n  if (props.ls2026_status === 'cancelled') {\n    results.push({ scan_id: scan.scan_id, token: scan.token, result: 'cancelled' });\n    continue;\n  }\n\n  const pending = updates.get(contact.id);\n  const existing = props.ls2026_checked_in_at || (pending && pending.ls2026_checked_in_at);\n\n  if (existing) {\n    // First check-in wins. If two devices raced offline, the earlier local\n    // timestamp is authoritative and the later one is logged, not applied.\n    const keepExisting = new Date(existing) <= new Date(scan.scanned_at);\n    if (!keepExisting) {\n      updates.set(contact.id, {\n        ls2026_status: 'attended',\n        ls2026_checked_in_at: new Date(scan.scanned_at).toISOString(),\n        ls2026_checkin_method: scan.method,\n        ls2026_checkin_device: scan.device,\n      });\n    }\n    results.push({\n      scan_id: scan.scan_id,\n      token: scan.token,\n      result: 'already_checked_in',\n      checked_in_at: keepExisting ? existing : new Date(scan.scanned_at).toISOString(),\n      device: keepExisting ? props.ls2026_checkin_device || pending?.ls2026_checkin_device || null : scan.device,\n    });\n    continue;\n  }\n\n  updates.set(contact.id, {\n    ls2026_status: 'attended',\n    ls2026_checked_in_at: new Date(scan.scanned_at).toISOString(),\n    ls2026_checkin_method: scan.method,\n    ls2026_checkin_device: scan.device,\n  });\n  results.push({\n    scan_id: scan.scan_id,\n    token: scan.token,\n    result: 'checked_in',\n    checked_in_at: new Date(scan.scanned_at).toISOString(),\n    device: scan.device,\n  });\n}\n\nconst inputs = [...updates.entries()].map(([id, properties]) => ({ id, properties }));\nreturn [{ json: { authorized: true, results, inputs, hasUpdates: inputs.length > 0 } }];\n"
+      }
+    },
+    {
+      "id": "apply-to-hubspot",
+      "name": "Apply to HubSpot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        780,
+        540
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/batch/update",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ inputs: $json.inputs }) }}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_CREDENTIAL_ID",
+          "name": "HubSpot Private App (LS2026)"
+        }
+      },
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "answer-scanner",
+      "name": "Answer scanner",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1000,
+        540
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// WF-E step 3 — mark scans applied and answer the scanner.\n//\n// A scan is only marked applied once HubSpot accepted the batch, so a failed\n// write is retried by the phone rather than silently swallowed.\n\nconst decision = $('Decide check-ins').first().json;\nconst batch = $input.first().json || {};\nconst writeFailed = decision.hasUpdates && (batch.error || batch.status === 'error');\n\nconst store = $getWorkflowStaticData('global');\nstore.appliedScans = store.appliedScans || {};\n\nconst results = decision.results.map((r) => {\n  const wroteNothing = ['not_found', 'cancelled'].includes(r.result);\n  if (writeFailed && !wroteNothing) return { ...r, result: 'retry' };\n  if (!wroteNothing) store.appliedScans[r.scan_id] = Date.now();\n  return r;\n});\n\nreturn reply(writeFailed ? 502 : 200, {\n  event_key: EVENT_KEY,\n  applied: results.filter((r) => r.result !== 'retry').length,\n  results,\n});\n"
+      }
+    },
+    {
+      "id": "checkin-unauthorized",
+      "name": "Checkin unauthorized",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        700
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const ALLOWED_ORIGIN = \"https://mes178.github.io\";\n// Shared helpers, inlined into every Code node by scripts/build_workflows.py.\n//\n// Secrets (staff PIN, HMAC secret) live in this workflow's static data, seeded\n// once by the \"Seed secrets\" manual trigger. They are therefore NOT in the\n// exported JSON that gets committed — see docs/SETUP.md.\n\nconst EVENT_KEY = 'ls2026';\nconst SESSION_TTL_HOURS = 24;\nconst PIN_MAX_ATTEMPTS = 5;\nconst PIN_WINDOW_MS = 15 * 60 * 1000;\n\nfunction secrets() {\n  const store = $getWorkflowStaticData('global');\n  if (!store.pin || !store.hmacSecret) {\n    throw new Error('Secrets are not seeded. Run the \"Seed secrets\" trigger once.');\n  }\n  return store;\n}\n\nfunction b64url(bytes) {\n  let binary = '';\n  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);\n  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);\n  return btoa(binary).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');\n}\n\nfunction fromB64url(text) {\n  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);\n  const binary = atob(padded);\n  const out = new Uint8Array(binary.length);\n  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);\n  return out;\n}\n\nasync function hmac(secret, message) {\n  const enc = new TextEncoder();\n  const key = await crypto.subtle.importKey(\n    'raw',\n    enc.encode(secret),\n    { name: 'HMAC', hash: 'SHA-256' },\n    false,\n    ['sign']\n  );\n  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));\n}\n\n/** Compare two strings without leaking their difference through timing. */\nfunction constantTimeEqual(a, b) {\n  const x = String(a);\n  const y = String(b);\n  let diff = x.length ^ y.length;\n  const len = Math.max(x.length, y.length);\n  for (let i = 0; i < len; i++) diff |= (x.charCodeAt(i) || 0) ^ (y.charCodeAt(i) || 0);\n  return diff === 0;\n}\n\nasync function issueSession(device) {\n  const payload = {\n    device,\n    issued_at: new Date().toISOString(),\n    expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),\n  };\n  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));\n  const sig = b64url(await hmac(secrets().hmacSecret, body));\n  return { token: `${body}.${sig}`, payload };\n}\n\n/** Returns the session payload, or null when the token is absent/forged/expired. */\nasync function verifySession(token) {\n  if (!token || typeof token !== 'string' || !token.includes('.')) return null;\n  const [body, sig] = token.split('.');\n  let expected;\n  try {\n    expected = b64url(await hmac(secrets().hmacSecret, body));\n  } catch (_) {\n    return null;\n  }\n  if (!constantTimeEqual(sig, expected)) return null;\n  let payload;\n  try {\n    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));\n  } catch (_) {\n    return null;\n  }\n  if (!payload.expires_at || new Date(payload.expires_at).getTime() < Date.now()) return null;\n  return payload;\n}\n\nconst CORS = {\n  'Access-Control-Allow-Origin': ALLOWED_ORIGIN,\n  'Access-Control-Allow-Headers': 'Content-Type, X-Session-Token',\n  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',\n  'Access-Control-Max-Age': '86400',\n};\n\nfunction reply(statusCode, body) {\n  return [{ json: { statusCode, headers: CORS, body } }];\n}\n\n/** Case-insensitive header lookup — proxies normalise header case differently. */\nfunction header(headers, name) {\n  const wanted = name.toLowerCase();\n  for (const key of Object.keys(headers || {})) {\n    if (key.toLowerCase() === wanted) return headers[key];\n  }\n  return undefined;\n}\n\n// Shared 401 branch. Also answers the CORS preflight, which carries no session.\n\nconst input = $input.first().json || {};\nif (input.preflight) return reply(204, {});\nreturn reply(401, { message: 'Sign in again.' });\n"
+      }
+    },
+    {
+      "id": "respond-checkin",
+      "name": "Respond checkin",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1220,
+        620
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "responseCode": "={{ $json.statusCode }}",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "={{ $json.headers['Access-Control-Allow-Origin'] }}"
+              },
+              {
+                "name": "Access-Control-Allow-Headers",
+                "value": "Content-Type, X-Session-Token"
+              },
+              {
+                "name": "Access-Control-Allow-Methods",
+                "value": "GET, POST, OPTIONS"
+              },
+              {
+                "name": "Cache-Control",
+                "value": "no-store"
+              }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Seed secrets": {
+      "main": [
+        [
+          {
+            "node": "Write secrets to store",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auth webhook": {
+      "main": [
+        [
+          {
+            "node": "Authenticate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Authenticate": {
+      "main": [
+        [
+          {
+            "node": "Respond auth",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Roster webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify roster session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify roster session": {
+      "main": [
+        [
+          {
+            "node": "Roster authorized?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Roster authorized?": {
+      "main": [
+        [
+          {
+            "node": "Roster page 1",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Roster unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Roster page 1": {
+      "main": [
+        [
+          {
+            "node": "Roster page 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Roster page 2": {
+      "main": [
+        [
+          {
+            "node": "Build roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build roster": {
+      "main": [
+        [
+          {
+            "node": "Respond roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Roster unauthorized": {
+      "main": [
+        [
+          {
+            "node": "Respond roster",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Checkin webhook": {
+      "main": [
+        [
+          {
+            "node": "Plan check-ins",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan check-ins": {
+      "main": [
+        [
+          {
+            "node": "Checkin authorized?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Checkin authorized?": {
+      "main": [
+        [
+          {
+            "node": "Look up tokens",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Checkin unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Look up tokens": {
+      "main": [
+        [
+          {
+            "node": "Decide check-ins",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decide check-ins": {
+      "main": [
+        [
+          {
+            "node": "Apply to HubSpot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply to HubSpot": {
+      "main": [
+        [
+          {
+            "node": "Answer scanner",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Answer scanner": {
+      "main": [
+        [
+          {
+            "node": "Respond checkin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Checkin unauthorized": {
+      "main": [
+        [
+          {
+            "node": "Respond checkin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Toronto"
+  }
+}
