@@ -112,6 +112,17 @@ then:
    `scripts/deploy_n8n.py` reads the live value back and re-injects it, so a
    redeploy never signs the desk out.
 
+   **Then publish.** n8n Cloud keeps the saved workflow and the *running* one
+   apart: Save updates the draft, while the webhook keeps serving the published
+   version. A PIN that is saved but not published looks exactly like a PIN that
+   was never set — `/auth` keeps answering 503. Hit Publish in the editor, or:
+
+   ```bash
+   python3 scripts/deploy_n8n.py --activate-api
+   ```
+
+   The same trap applies to every edit made in the n8n UI, not just the PIN.
+
 2. Activate the Check-In API. Leave the token issuer inactive until the question
    in "Parallel stack" below is settled.
 3. Confirm the webhook URLs match `config.js`.

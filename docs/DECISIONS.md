@@ -56,7 +56,7 @@ before the invitations go out.
 
 ## Found on the live instance
 
-Five things only showed up once the workflows were running against real n8n:
+Six things only showed up once the workflows were running against real n8n:
 
 **A multi-method webhook has one output per method, and n8n picks their order —
 not you.** `httpMethods: ["POST", "OPTIONS"]` put POST on output *1*, so wiring
@@ -75,6 +75,12 @@ reported success and persisted nothing, so `/auth` stayed 503. Secrets are now
 constants — the PIN edited in the `Authenticate` node, the signing secret injected
 at deploy from a gitignored file. Static data still carries the rate limiter and
 replay guard, which only production executions write.
+
+**Saving a workflow in the n8n editor does not change what the webhook serves.**
+n8n Cloud separates the saved draft from the published version, so a PIN typed in
+and saved behaved exactly like a PIN that was never set — `/auth` went on
+answering 503 while the workflow record clearly held the value. Reactivating
+publishes it. Anything edited in the UI needs the same step.
 
 **A Code node in "run once for each item" mode rejects `$input.first()`** and must
 return a single object rather than an array. Both per-item nodes in the issuer hit
@@ -121,8 +127,6 @@ contact's `ls2026_*` properties were cleared. The contact
 
 ## Still open
 
-- **The staff PIN is not set**, so `/auth` answers 503 by design. It is one line
-  in the `Authenticate` node; nobody but the marketing lead should type it.
 - **The confirmation email and the landing page are not built yet.** Event
   details are now settled: Life Science Event, Tuesday 6 October 2026, 6:00 PM,
   Jewel Box at MaRS Discovery District, 101 College Street, Toronto, ON M5G 0A3.
