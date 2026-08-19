@@ -112,7 +112,7 @@
 
   function signOut(message) {
     localStorage.removeItem('session');
-    localStorage.removeItem('device');
+    localStorage.removeItem('device');  // 'lastDevice' survives on purpose
     state.session = null;
     state.device = null;
     setSignedIn(false);
@@ -504,8 +504,16 @@
     const device = $('device').value.trim();
     const pin = $('pin').value.trim();
     $('login-error').textContent = '';
-    if (!device || !pin) {
-      $('login-error').textContent = 'Device label and PIN are both required.';
+    // Name the field that is actually missing: at a busy desk, "both are
+    // required" next to a filled-looking field is a puzzle nobody has time for.
+    if (!device) {
+      $('login-error').textContent = 'Give this phone a device label, e.g. Desk 1.';
+      $('device').focus();
+      return;
+    }
+    if (!pin) {
+      $('login-error').textContent = 'Enter the staff PIN.';
+      $('pin').focus();
       return;
     }
     try {
@@ -518,6 +526,7 @@
       state.device = device;
       localStorage.setItem('session', state.session);
       localStorage.setItem('device', device);
+      localStorage.setItem('lastDevice', device);
       $('pin').value = '';
       setSignedIn(true);
       await loadRosterFromDb();
@@ -601,6 +610,8 @@
     wire();
     state.session = localStorage.getItem('session');
     state.device = localStorage.getItem('device');
+    const lastDevice = localStorage.getItem('lastDevice');
+    if (lastDevice) $('device').value = lastDevice;
 
     if (state.session) {
       setSignedIn(true);

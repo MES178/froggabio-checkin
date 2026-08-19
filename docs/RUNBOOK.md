@@ -23,6 +23,8 @@ For whoever is running the registration desk — not necessarily whoever built t
 
 1. Charge every device to 100%. Bring power banks — the camera drains a phone fast.
 2. Sign in on each device with a **distinct label**: Desk 1, Desk 2, Desk 3.
+   The field starts filled in as "Desk 1" — change it on the second and third
+   phone, or every check-in will look like it came from the same desk.
 3. **Download the door list on every device** while on known-good Wi-Fi, ideally
    before leaving the office.
 4. Check that each device shows the same attendee count.

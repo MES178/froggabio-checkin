@@ -148,6 +148,7 @@ button {
 .stat { font-size: 24px; font-weight: 700; }
 .muted { color: var(--muted); font-size: 14px; }
 .error { color: #ff9d8f; min-height: 20px; }
+.hint { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
 
 .warning {
   background: #3a2a05;
