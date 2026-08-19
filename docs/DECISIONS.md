@@ -54,12 +54,43 @@ inventing a legal control. Spec §12.1 still applies: someone who owns privacy
 compliance should confirm the existing consent language covers this processing
 before the invitations go out.
 
+## Found on the live instance
+
+Two things only showed up once the workflows were running against real n8n:
+
+**A multi-method webhook has one output per method, and n8n picks their order —
+not you.** `httpMethods: ["POST", "OPTIONS"]` put POST on output *1*, so wiring
+output 0 alone meant every POST ran the trigger and then silently stopped. Every
+output is now wired to the same handler, which is correct whatever the ordering.
+
+**n8n answers the CORS preflight itself and echoes whatever Origin it is sent.**
+Verified: a preflight from `https://evil.example.com` came back with
+`Access-Control-Allow-Origin: https://evil.example.com`. That is the `*` the spec
+forbids, wearing a disguise. Fixed by pinning `options.allowedOrigins` on all
+three webhook nodes; the attacker origin now gets our origin back instead.
+
+## Parallel implementation
+
+The same system was being built in parallel with different tooling in the same
+n8n instance. Ours is kept strictly separate: `ls2026-cc/*` webhook paths, an
+`LS2026 (CC)` name prefix that the deploy script enforces, and a different Pages
+repository. Nothing of theirs is read, modified or activated.
+
+The two token issuers both write `ls2026_token`, so only one may ever run — ours
+is deployed **inactive**. Their QR holds a URL rather than a bare token, so this
+scanner now also accepts a token in a `t`/`token`/`code` query parameter and will
+read codes from either stack.
+
 ## Still open
 
-- **n8n API key is expired** (the Public API returns 401), so the workflows are
-  built and unit-tested but not yet deployed.
-- **Event details** — exact public name, venue address and start time — are not
-  confirmed. They appear only in the confirmation email and the landing page.
+- **The staff PIN is not seeded**, so `/auth` answers 503 by design. One run of
+  the `Seed secrets` trigger in n8n fixes it; nobody but the marketing lead should
+  ever type that PIN.
+- **The venue address is still unknown.** Name and start time are set (Life
+  Science Event, 6 October 2026, 6:00 PM); `docs/email-module.html` still carries
+  a `VENUE_ADDRESS` placeholder.
+- **Which token issuer runs** — ours or the parallel one — is undecided, and the
+  confirmation email and landing page are not built yet.
 - **Q9 ownership** above.
 - The business decision between this build, SimpleEvents.io and Ticket Tailor sits
   with Harel and Chris. This system exists; it has not been chosen.

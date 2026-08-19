@@ -54,7 +54,13 @@ else, with only:
 Do not grant schema-write scopes. The properties already exist; a token that can
 rewrite the CRM schema is a much worse thing to leak.
 
-## 4. n8n credential
+## 4. n8n credential — done
+
+Header Auth credential `HubSpot Private App (LS2026 CC)`, id `SG7zuxUhsoSeYZ7H`,
+created by `scripts/deploy_n8n.py`. It currently carries the shared FroggaBio
+service key; swap it for a dedicated private app before the event.
+
+### Recreating it
 
 In n8n → Credentials → **Header Auth**, named `HubSpot Private App (LS2026)`:
 
@@ -64,7 +70,26 @@ In n8n → Credentials → **Header Auth**, named `HubSpot Private App (LS2026)`
 This is the only place the HubSpot token exists. Note the credential id — the
 workflow JSON ships with `REPLACE_WITH_CREDENTIAL_ID` in its place.
 
-## 5. Deploy the workflows
+## 5. Deploy the workflows — done
+
+```bash
+python3 scripts/deploy_n8n.py --activate-api
+```
+
+Live now:
+
+| Workflow | id | Active |
+|---|---|---|
+| `LS2026 (CC) — Check-In API` | `37PZKD5ElbQ9cmmL` | **yes** |
+| `LS2026 (CC) — Issue Tokens` | `71T3IuWfKboHaqkd` | **no — deliberately** |
+
+Endpoints (note the `-cc` — see "Parallel stack" below):
+
+- `POST https://fgbio.app.n8n.cloud/webhook/ls2026-cc/auth`
+- `GET  https://fgbio.app.n8n.cloud/webhook/ls2026-cc/roster`
+- `POST https://fgbio.app.n8n.cloud/webhook/ls2026-cc/checkin`
+
+### Rebuilding from source
 
 ```bash
 python3 scripts/build_workflows.py --origin https://mes178.github.io
@@ -95,9 +120,14 @@ the QR must go in through HubL.
 The service key cannot publish marketing emails (no `marketing-email` scope), so
 this email is built in the HubSpot UI by hand.
 
-## 7. Scanner
+## 7. Scanner — done
 
-Publish the repository root to GitHub Pages. `config.js` holds the n8n base URL
+Published at **https://mes178.github.io/froggabio-checkin/** from the `main`
+branch of `MES178/froggabio-checkin`.
+
+### Republishing
+
+Push to `main`; Pages serves the repository root. `config.js` holds the n8n base URL
 and the event key, and nothing else — no token, no PIN, no attendee data.
 
 After deploying, confirm the CORS origin baked into the workflows matches the
@@ -111,3 +141,26 @@ node scripts/test_api_nodes.js  # auth, sessions, check-in decisions, roster sha
 ```
 
 Both run offline and need no credentials.
+
+## Parallel stack — do not collide
+
+A second implementation of this same system exists in the same n8n instance,
+built alongside this one with different tooling:
+
+| Theirs | Ours |
+|---|---|
+| `LS2026 — Staff Auth`, `— Roster API`, `— Check-in API`, `— Registration QR Issuance` | `LS2026 (CC) — Check-In API`, `— Issue Tokens` |
+| webhook paths `ls2026/*` | webhook paths `ls2026-cc/*` |
+| Pages site `froggabio-event-checkin` | Pages site `froggabio-checkin` |
+
+Nothing here reads, edits or activates theirs; `scripts/deploy_n8n.py` refuses to
+touch any workflow whose name does not start with `LS2026 (CC)`.
+
+**Both token issuers write the same `ls2026_token` property.** Running both would
+hand the same contact two different tokens and invalidate QR codes already sitting
+in people's inboxes. Ours is therefore left **inactive**. Exactly one of the two
+may ever be switched on.
+
+Their QR encodes a URL (`https://mes178.github.io/froggabio-event-checkin/?t=…`)
+rather than a bare token, so this scanner also accepts a token carried in a `t`,
+`token` or `code` query parameter — either stack's codes will scan here.

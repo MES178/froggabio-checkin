@@ -2,8 +2,8 @@
 
 For whoever is running the registration desk — not necessarily whoever built this.
 
-**Scanner:** https://mes178.github.io/froggabio-checkin/ (confirm before printing this)
-**Event:** FroggaBio Life Science Event, Tuesday 6 October 2026
+**Scanner:** https://mes178.github.io/froggabio-checkin/
+**Event:** Life Science Event, Tuesday 6 October 2026, 6:00 PM
 **PIN:** ask the marketing lead. It is not written down here.
 
 ---

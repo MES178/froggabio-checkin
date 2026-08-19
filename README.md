@@ -4,7 +4,12 @@ Registrants get a unique QR code by email. Desk staff scan it with an ordinary
 phone. Attendance lands in HubSpot in real time, so the "attended" and "no-show"
 segments build themselves.
 
-Built for the **Life Science Event, 6 October 2026**.
+Built for the **Life Science Event, 6 October 2026, 6:00 PM**.
+
+Scanner: **https://mes178.github.io/froggabio-checkin/**
+
+A second implementation of the same system exists in the same n8n instance;
+see "Parallel stack" in `docs/SETUP.md` before switching anything on.
 
 ## How it works
 
