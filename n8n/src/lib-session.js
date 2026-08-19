@@ -17,31 +17,15 @@ function secrets() {
   return store;
 }
 
-function b64url(bytes) {
-  let binary = '';
-  const arr = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  for (let i = 0; i < arr.length; i++) binary += String.fromCharCode(arr[i]);
-  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-}
+// The Code-node sandbox has no `crypto` global and forbids 'node:crypto',
+// but plain require('crypto') is allowed — verified against the live instance.
+const nodeCrypto = require('crypto');
 
-function fromB64url(text) {
-  const padded = text.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((text.length + 3) % 4);
-  const binary = atob(padded);
-  const out = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
-  return out;
-}
+const b64url = (bytes) => Buffer.from(bytes).toString('base64url');
+const fromB64url = (text) => Buffer.from(text, 'base64url');
 
-async function hmac(secret, message) {
-  const enc = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-  return new Uint8Array(await crypto.subtle.sign('HMAC', key, enc.encode(message)));
+function hmac(secret, message) {
+  return nodeCrypto.createHmac('sha256', secret).update(message).digest();
 }
 
 /** Compare two strings without leaking their difference through timing. */
@@ -54,31 +38,31 @@ function constantTimeEqual(a, b) {
   return diff === 0;
 }
 
-async function issueSession(device) {
+function issueSession(device) {
   const payload = {
     device,
     issued_at: new Date().toISOString(),
     expires_at: new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000).toISOString(),
   };
-  const body = b64url(new TextEncoder().encode(JSON.stringify(payload)));
-  const sig = b64url(await hmac(secrets().hmacSecret, body));
+  const body = b64url(Buffer.from(JSON.stringify(payload), 'utf8'));
+  const sig = b64url(hmac(secrets().hmacSecret, body));
   return { token: `${body}.${sig}`, payload };
 }
 
 /** Returns the session payload, or null when the token is absent/forged/expired. */
-async function verifySession(token) {
+function verifySession(token) {
   if (!token || typeof token !== 'string' || !token.includes('.')) return null;
   const [body, sig] = token.split('.');
   let expected;
   try {
-    expected = b64url(await hmac(secrets().hmacSecret, body));
+    expected = b64url(hmac(secrets().hmacSecret, body));
   } catch (_) {
     return null;
   }
   if (!constantTimeEqual(sig, expected)) return null;
   let payload;
   try {
-    payload = JSON.parse(new TextDecoder().decode(fromB64url(body)));
+    payload = JSON.parse(fromB64url(body).toString('utf8'));
   } catch (_) {
     return null;
   }

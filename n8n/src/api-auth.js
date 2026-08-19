@@ -52,7 +52,7 @@ for (const [key, value] of Object.entries(store.pinAttempts)) {
   if (now - value.first > PIN_WINDOW_MS) delete store.pinAttempts[key];
 }
 
-const session = await issueSession(device);
+const session = issueSession(device);
 return reply(200, {
   session_token: session.token,
   expires_at: session.payload.expires_at,

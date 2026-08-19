@@ -56,12 +56,18 @@ before the invitations go out.
 
 ## Found on the live instance
 
-Two things only showed up once the workflows were running against real n8n:
+Three things only showed up once the workflows were running against real n8n:
 
 **A multi-method webhook has one output per method, and n8n picks their order —
 not you.** `httpMethods: ["POST", "OPTIONS"]` put POST on output *1*, so wiring
 output 0 alone meant every POST ran the trigger and then silently stopped. Every
 output is now wired to the same handler, which is correct whatever the ordering.
+
+**The Code-node sandbox has no `crypto` global.** `crypto.randomUUID`,
+`getRandomValues` and `crypto.subtle` are all undefined, and `require('node:crypto')`
+is blocked — but plain `require('crypto')` is allowed and gives `randomUUID`,
+`randomBytes` and `createHmac`. Session signing, token minting and secret seeding
+all use that now, verified by probing the live sandbox.
 
 **n8n answers the CORS preflight itself and echoes whatever Origin it is sent.**
 Verified: a preflight from `https://evil.example.com` came back with
@@ -86,9 +92,9 @@ read codes from either stack.
 - **The staff PIN is not seeded**, so `/auth` answers 503 by design. One run of
   the `Seed secrets` trigger in n8n fixes it; nobody but the marketing lead should
   ever type that PIN.
-- **The venue address is still unknown.** Name and start time are set (Life
-  Science Event, 6 October 2026, 6:00 PM); `docs/email-module.html` still carries
-  a `VENUE_ADDRESS` placeholder.
+- **The confirmation email and the landing page are not built yet.** Event
+  details are now settled: Life Science Event, Tuesday 6 October 2026, 6:00 PM,
+  Jewel Box at MaRS Discovery District, 101 College Street, Toronto, ON M5G 0A3.
 - **Which token issuer runs** — ours or the parallel one — is undecided, and the
   confirmation email and landing page are not built yet.
 - **Q9 ownership** above.

@@ -10,15 +10,16 @@
 
 const STAFF_PIN = ''; // <- put the desk PIN here for one run, then clear it
 
+// No `crypto` global in the Code-node sandbox; require('crypto') is allowed.
+const nodeCrypto = require('crypto');
+
 const store = $getWorkflowStaticData('global');
 
 if (STAFF_PIN) {
   store.pin = STAFF_PIN;
 }
 if (!store.hmacSecret) {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  store.hmacSecret = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  store.hmacSecret = nodeCrypto.randomBytes(32).toString('hex');
 }
 
 return [

@@ -36,11 +36,14 @@ async function runNode(name, { input, nodeOutputs = {} }) {
       first: () => ({ json: nodeOutputs[nodeName] }),
       item: { json: nodeOutputs[nodeName] },
     }),
-    crypto: require('crypto').webcrypto,
+    // The n8n sandbox exposes require('crypto') and no crypto global — mirror
+    // that here so the tests exercise what actually runs.
+    require: (name) => {
+      if (name === 'crypto') return require('crypto');
+      throw new Error(`Module '${name}' is disallowed`);
+    },
     TextEncoder,
     TextDecoder,
-    btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
-    atob: (s) => Buffer.from(s, 'base64').toString('binary'),
     console,
     Buffer,
   };
@@ -54,7 +57,10 @@ async function runNode(name, { input, nodeOutputs = {} }) {
   const seedBody = bodyOf('Write secrets to store').replace("const STAFF_PIN = '';", "const STAFF_PIN = '4821';");
   const seedCtx = {
     $getWorkflowStaticData: () => staticData,
-    crypto: require('crypto').webcrypto,
+    require: (name) => {
+      if (name === 'crypto') return require('crypto');
+      throw new Error(`Module '${name}' is disallowed`);
+    },
     console,
   };
   seedCtx.globalThis = seedCtx;
@@ -94,25 +100,18 @@ async function runNode(name, { input, nodeOutputs = {} }) {
   const [payloadPart] = session.split('.');
   const forged = Buffer.from(
     JSON.stringify({ device: 'Evil', expires_at: new Date(Date.now() + 3.6e6).toISOString() })
-  )
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+  ).toString('base64url');
   check('forged payload with old signature is rejected', !(await verify(`${forged}.${session.split('.')[1]}`)));
   check('payload survives the round trip', typeof payloadPart === 'string' && payloadPart.length > 10);
 
   // ---- expired session ----------------------------------------------------
-  const enc = new TextEncoder();
-  const key = await require('crypto').webcrypto.subtle.importKey(
-    'raw', enc.encode(staticData.hmacSecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  const b64url = (buf) =>
-    Buffer.from(buf).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const b64url = (buf) => Buffer.from(buf).toString('base64url');
   const expiredBody = b64url(
-    enc.encode(JSON.stringify({ device: 'Desk 1', expires_at: new Date(Date.now() - 1000).toISOString() }))
+    Buffer.from(JSON.stringify({ device: 'Desk 1', expires_at: new Date(Date.now() - 1000).toISOString() }))
   );
-  const expiredSig = b64url(await require('crypto').webcrypto.subtle.sign('HMAC', key, enc.encode(expiredBody)));
+  const expiredSig = b64url(
+    require('crypto').createHmac('sha256', staticData.hmacSecret).update(expiredBody).digest()
+  );
   check('expired session is rejected', !(await verify(`${expiredBody}.${expiredSig}`)));
 
   // ---- check-in decisions -------------------------------------------------

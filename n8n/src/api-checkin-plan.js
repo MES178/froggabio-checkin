@@ -7,7 +7,7 @@ const req = $input.first().json;
 const method = (req.method || 'POST').toUpperCase();
 if (method === 'OPTIONS') return [{ json: { authorized: false, preflight: true, tokens: [] } }];
 
-const session = await verifySession(header(req.headers, 'x-session-token'));
+const session = verifySession(header(req.headers, 'x-session-token'));
 if (!session) return [{ json: { authorized: false, tokens: [], scans: [] } }];
 
 const scans = Array.isArray((req.body || {}).scans) ? req.body.scans : [];

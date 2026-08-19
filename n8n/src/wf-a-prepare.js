@@ -4,6 +4,9 @@
 // have a token. A token is never regenerated — the attendee may already be
 // holding that QR in their inbox.
 
+// No `crypto` global in the Code-node sandbox; require('crypto') is allowed.
+const nodeCrypto = require('crypto');
+
 const EVENT_KEY = 'ls2026';
 // No I, O, 0 or 1 — those are the characters staff misread off a phone screen.
 const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -11,20 +14,11 @@ const ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
 const store = $getWorkflowStaticData('global');
 store.issuedCodes = store.issuedCodes || {};
 
-function uuidV4() {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
-  const bytes = new Uint8Array(16);
-  crypto.getRandomValues(bytes);
-  bytes[6] = (bytes[6] & 0x0f) | 0x40;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
+const uuidV4 = () => nodeCrypto.randomUUID();
 
 function randomCode() {
-  const picks = new Uint32Array(8);
-  crypto.getRandomValues(picks);
-  const chars = [...picks].map((n) => ALPHABET[n % ALPHABET.length]);
+  const bytes = nodeCrypto.randomBytes(8);
+  const chars = [...bytes].map((n) => ALPHABET[n % ALPHABET.length]);
   return `${chars.slice(0, 4).join('')}-${chars.slice(4).join('')}`;
 }
 

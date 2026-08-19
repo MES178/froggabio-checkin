@@ -4,6 +4,7 @@ For whoever is running the registration desk — not necessarily whoever built t
 
 **Scanner:** https://mes178.github.io/froggabio-checkin/
 **Event:** Life Science Event, Tuesday 6 October 2026, 6:00 PM
+**Venue:** Jewel Box at MaRS Discovery District, 101 College Street, Toronto, ON M5G 0A3
 **PIN:** ask the marketing lead. It is not written down here.
 
 ---
